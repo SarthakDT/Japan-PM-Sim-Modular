@@ -65,8 +65,17 @@ PREFECTURE_POPULATIONS = {
 }
 
 
-DEFAULT_PM_NAME = "Shigeru Ishiba"
-DEFAULT_PARTY_NAME = "Liberal Democratic Party"
+DEFAULT_PM_NAME = "Sanae Takaichi"
+DEFAULT_PARTY_NAME = "LDP-Ishin Alliance"
+
+LAST_ELECTION_DATE = datetime.date(2026, 2, 8)
+START_DATE = datetime.date(2026, 2, 9)
+TERM_DURATION_DAYS = 1460
+COALITION_SEATS_BASELINE = 352
+DIET_TOTAL_SEATS = 465
+MAJORITY_THRESHOLD = 233
+SUPERMAJORITY_THRESHOLD = 310
+BASELINE_APPROVAL_2026 = 55.0
 
 class Prefecture:
     # ** MODIFIED: Added population_growth_rate **
@@ -154,7 +163,7 @@ class RivalParty:
         messages = {
             "economy": [
                 f"{self.name} criticizes the government's failed economic policies!",
-                f"'{self.party_name}'s economic plan is hurting families,' claims {self.name}.",
+                f"'The government's economic plan is hurting families,' claims {self.name}.",
                 f"{self.name} points to rising inflation under the current administration."
             ],
             "scandal": [
@@ -164,12 +173,12 @@ class RivalParty:
             ],
             "welfare": [
                 f"{self.name} argues that welfare programs are being neglected.",
-                f"'{self.party_name} doesn't care about the elderly,' says {self.name}.",
+                f"'The ruling coalition doesn't care about the elderly,' says {self.name}.",
                 f"{self.name} promises better social support if elected."
             ],
             "competence": [
                 f"{self.name} slams the government's handling of recent events.",
-                f"'{self.party_name} is out of touch with the people,' states {self.name}.",
+                f"'The ruling coalition is out of touch with the people,' states {self.name}.",
                 f"{self.name} questions the PM's leadership abilities."
             ]
         }
@@ -712,20 +721,29 @@ class Simulation:
         self.pm_name = pm_name if pm_name else DEFAULT_PM_NAME
         self.party_name = party_name if party_name else DEFAULT_PARTY_NAME
         self.pm = PrimeMinister(self.pm_name, self.party_name)
-        self.day = 1
-        self.month = 1
-        self.year = 2025
+        self.current_date = START_DATE
+        self.last_election_date = LAST_ELECTION_DATE
+        self.day = self.current_date.day
+        self.month = self.current_date.month
+        self.year = self.current_date.year
         self.running = True
         self.game_over_reason = None
-        
-        # ** NEW: Election state management **
-        self.election_in_progress = None # Can be None, 'triggered', 'attack_phase', 'voting_day'
-        self.election_attack_messages = [] # Store messages for the popup
+        self.coalition_name = "LDP-Ishin + CRA"
+        self.seats = COALITION_SEATS_BASELINE
+        self.override_power = True
+        self.days_to_term_end = TERM_DURATION_DAYS
+
+        # election state
+        self.election_in_progress = None
+        self.election_attack_messages = []
+        self.election_survival_message = None
+        self.last_event_type = None
+        self.desperation_penalty_armed = False
         
         # Initial calculation
         self.pm.calculate_global_approval(self.prefectures)
         self.approval_history = [self.pm.global_approval]
-        self.approval_dates = [datetime.date(self.year, self.month, self.day)]
+        self.approval_dates = [self.current_date]
         
         self.rivals = [
             RivalParty("Constitutional Democratic Party"),
@@ -923,94 +941,84 @@ class Simulation:
         self.pm.calculate_global_approval(self.prefectures)
         self.events.append(f"Event: {event_name}")
         if len(self.events) > 10: self.events.pop(0)
-
-        self.check_for_election()
+        self.last_event_type = "Scandal" if event_type == "scandal" else event_type
         return event_type, event_name
+
+    def get_days_until_next_election(self):
+        term_end = self.last_election_date + datetime.timedelta(days=TERM_DURATION_DAYS)
+        return (term_end - self.current_date).days
+
+    def trigger_election(self, reason="PM Dissolution", manual=False):
+        if not self.running or self.election_in_progress:
+            return False
+        self.election_in_progress = 'triggered'
+        self.desperation_penalty_armed = bool(
+            manual and (self.last_event_type == "Scandal" or self.pm.global_approval < 40.0)
+        )
+        self.events.append(f"ELECTION CALL: {reason} by PM {self.pm.name}")
+        return True
+
+    def dissolve_diet(self):
+        return self.trigger_election(reason="PM Dissolution", manual=True)
 
     # ** MODIFIED: Advance day handles population growth and election state **
     def advance_day(self):
         """Advance the simulation by one day, handling growth and elections."""
-        if not self.running: return None, None
+        if not self.running:
+            return None, None
 
-        # --- Handle Election State Machine ---
+        # election timeline handling
         if self.election_in_progress == 'triggered':
             self.election_in_progress = 'attack_phase'
-            self.handle_election_attacks() # Run attacks, update approval
-            # Record approval *after* attacks
+            self.handle_election_attacks()
             self.approval_history.append(self.pm.global_approval)
-            self.approval_dates.append(datetime.date(self.year, self.month, self.day))
-            # Return immediately, day advances effectively to attack day results
+            self.approval_dates.append(self.current_date)
             return "election_attack", "Rival parties launch attacks!"
 
-        elif self.election_in_progress == 'attack_phase':
+        if self.election_in_progress == 'attack_phase':
             self.election_in_progress = 'voting_day'
-            # No approval change today, just transition state
-            # Day advances to voting day
-            # Record approval (should be same as end of attack day)
             self.approval_history.append(self.pm.global_approval)
-            self.approval_dates.append(datetime.date(self.year, self.month, self.day))
+            self.approval_dates.append(self.current_date)
             return "election_voting", "Election voting begins!"
 
-        elif self.election_in_progress == 'voting_day':
-            self.handle_election_voting() # This will set running=False if lost
-            self.election_in_progress = None # Election cycle ends
-            # Record final approval after vote outcome (might be unchanged if won)
+        if self.election_in_progress == 'voting_day':
+            self.handle_election_voting()
+            self.election_in_progress = None
             self.approval_history.append(self.pm.global_approval)
-            self.approval_dates.append(datetime.date(self.year, self.month, self.day))
-            # If still running, proceed with normal day advancement below
+            self.approval_dates.append(self.current_date)
             if not self.running:
-                 return "election_result", "Election results are in!" # Game Over handled by check later
-            # If survived, continue to normal day processing for the day *after* voting
+                return "election_result", "Election results are in!"
 
+        # normal day progression
+        self.current_date += datetime.timedelta(days=1)
+        self.day = self.current_date.day
+        self.month = self.current_date.month
+        self.year = self.current_date.year
 
-        # --- Normal Day Advancement ---
-        # Update Date
-        self.day += 1
-        days_in_month = 30 # Simplified month length (can be improved)
-        if self.month == 2: days_in_month = 28
-        if self.day > days_in_month:
-            self.day = 1; self.month += 1
-            if self.month > 12: self.month = 1; self.year += 1
-
-        # Apply daily population growth
         for p in self.prefectures:
             p.update_daily_population()
-
-        # Apply slight daily drift/changes to other stats (optional)
-        for p in self.prefectures:
-            p.approval += random.uniform(-0.1, 0.1) # Random drift
+            p.approval += random.uniform(-0.1, 0.1)
             p.economy += random.uniform(-0.005, 0.005)
             p.unemployment += random.uniform(-0.01, 0.01)
             p.normalize_values()
 
-        # Recalculate global approval after drift
         self.pm.calculate_global_approval(self.prefectures)
 
-        # Check for random events (which includes election check)
         event_type, event_name = self.random_event()
 
-        # Record history (only if not handled by election logic above)
-        if self.election_in_progress is None:
-            try:
-                 current_date = datetime.date(self.year, self.month, self.day)
-            except ValueError: # Handle invalid dates like Feb 30
-                 # Attempt to fix the date, e.g., go to last valid day of previous month? Or first of current?
-                 try:
-                     current_date = datetime.date(self.year, self.month, self.day - 1) # Try previous day
-                 except ValueError:
-                     current_date = datetime.date(self.year, self.month, 1) # Fallback
+        self.days_to_term_end = self.get_days_until_next_election()
+        self.check_for_election()
 
-            self.approval_history.append(self.pm.global_approval)
-            self.approval_dates.append(current_date)
+        self.approval_history.append(self.pm.global_approval)
+        self.approval_dates.append(self.current_date)
 
-
-        # Final check (mainly for game over state after events/voting)
-        if not self.running: return None, None # Ensure game over state stops further processing
-
+        if not self.running:
+            return None, None
         return event_type, event_name
 
 
     # ** NEW: Election attack phase logic **
+
     def handle_election_attacks(self):
         """Simulates rival attacks during the election campaign."""
         if not self.running: return
@@ -1044,126 +1052,63 @@ class Simulation:
 
     # ** NEW: Election voting logic (separated from check) **
     def handle_election_voting(self):
-        """Counts votes and determines election outcome."""
-        if not self.running: return
+        """Seat projection model for election outcomes."""
+        if not self.running:
+            return
 
-        votes_to_keep = 0
-        votes_to_oust = 0
-        total_prefectures = len(self.prefectures)
+        approval_swing = self.pm.global_approval - BASELINE_APPROVAL_2026
+        seat_change = int(approval_swing * random.uniform(4, 6))
 
-        for prefecture in self.prefectures:
-            if prefecture.approval >= 50.0:
-                votes_to_keep += 1
-            else:
-                votes_to_oust += 1
+        if self.desperation_penalty_armed:
+            penalty = random.randint(10, 20)
+            seat_change -= penalty
+            self.events.append(f"Desperation Penalty applied: -{penalty} seats")
 
-        print(f"Election Voting Results: Keep: {votes_to_keep}, Oust: {votes_to_oust}") # Debug
+        self.seats = max(0, min(DIET_TOTAL_SEATS, COALITION_SEATS_BASELINE + seat_change))
+        self.last_election_date = self.current_date
+        self.days_to_term_end = self.get_days_until_next_election()
+        self.override_power = self.seats >= SUPERMAJORITY_THRESHOLD
+        self.desperation_penalty_armed = False
 
-        # PM loses if more than half vote to oust
-        if votes_to_oust > total_prefectures / 2:
-            self.running = False # Set game state to over
-            self.game_over_reason = (f"Lost Election!\n"
-                                     f"Final Vote: Keep {votes_to_keep}, Oust {votes_to_oust}. "
-                                     f"({votes_to_oust}/{total_prefectures} prefectures voted against you).")
-            self.events.append("Election Result: Lost!")
-            print("Election Lost!") # Debug
+        if self.seats < MAJORITY_THRESHOLD:
+            self.running = False
+            self.game_over_reason = f"Lost Majority! Coalition fell to {self.seats} seats."
+            self.events.append(self.game_over_reason)
         else:
-             # PM survives the election
-             self.events.append("Election Result: Survived!")
-             # Store message to be shown by App
-             self.election_survival_message = (f"Election Survived!\n"
-                                               f"Votes to Keep: {votes_to_keep}\n"
-                                               f"Votes to Oust: {votes_to_oust}\n"
-                                               f"Your position is secure... for now.")
-             # Optional: Small approval boost for surviving?
-             boost = random.uniform(1.0, 4.0)
-             for p in self.prefectures:
-                 p.approval += boost
-                 p.normalize_values()
-             self.pm.calculate_global_approval(self.prefectures)
-             self.events.append(f"Approval boosted slightly after surviving election (+{boost:.1f}% approx).")
+            status = "Supermajority Intact" if self.override_power else "Majority Secured"
+            self.election_survival_message = (
+                f"Election Results: {self.seats}/{DIET_TOTAL_SEATS} seats. {status}."
+            )
+            self.events.append(self.election_survival_message)
 
 
     # ** MODIFIED: Election check only triggers the process **
-    def check_for_election(self):
-        """Checks if global approval triggers an election."""
-        if not self.running or self.election_in_progress: return # Don't trigger if game over or election already happening
 
-        election_threshold = 30.0 # ** CHANGED THRESHOLD **
-        if self.pm.global_approval < election_threshold:
-            self.election_in_progress = 'triggered'
-            print(f"Approval dropped to {self.pm.global_approval:.2f}%, election process triggered!") # Debug
-            self.events.append(f"Approval below {election_threshold}%! Election Triggered!")
-            # Message will be shown by App based on state change
+    def check_for_election(self):
+        """Election trigger now follows term expiry only (unless PM dissolves manually)."""
+        if not self.running or self.election_in_progress:
+            return
+        if self.days_to_term_end <= 0:
+            self.trigger_election(reason="Term Expired", manual=False)
 
 
     def skip_year(self):
-        """Skip ahead by one year, simulating daily changes."""
+        """Skip ahead by one year using the same daily election logic."""
         if not self.running or self.election_in_progress:
-             print("Cannot skip year while game is over or election is in progress.")
-             return self.running
+            print("Cannot skip year while game is over or election is in progress.")
+            return self.running
 
-        original_date_str = f"{self.day}/{self.month}/{self.year}"
-        num_days_to_skip = 365 # Approximate a year
+        start_date = self.current_date
+        for _ in range(365):
+            self.advance_day()
+            if not self.running or self.election_in_progress:
+                break
 
-        for i in range(num_days_to_skip):
-            # --- Simulate one day ---
-            if self.election_in_progress == 'triggered':
-                self.election_in_progress = 'attack_phase'
-                self.handle_election_attacks()
-            elif self.election_in_progress == 'attack_phase':
-                self.election_in_progress = 'voting_day'
-            elif self.election_in_progress == 'voting_day':
-                self.handle_election_voting()
-                self.election_in_progress = None
-                if not self.running: # Check if game ended after voting
-                     final_date = (datetime.date(self.year, self.month, self.day) + datetime.timedelta(days=i+1))
-                     self.year, self.month, self.day = final_date.year, final_date.month, final_date.day
-                     print(f"Game ended during year skip (election) on {self.day}/{self.month}/{self.year}")
-                     self.approval_history.append(self.pm.global_approval); self.approval_dates.append(final_date)
-                     return False # Stop skipping
-
-            # Apply daily growth if no election is happening or after it resolves
-            if self.election_in_progress is None:
-                for p in self.prefectures: p.update_daily_population()
-
-            # Apply drift/changes
-            for p in self.prefectures:
-                p.approval += random.uniform(-0.15, 0.15) # Slightly larger drift for skips
-                p.normalize_values()
-            self.pm.calculate_global_approval(self.prefectures)
-
-            # Higher chance of random event during skip
-            if random.random() < 0.05: # 5% chance per skipped day
-                self.random_event()
-                if not self.running: # Check if event caused game over
-                    final_date = (datetime.date(self.year, self.month, self.day) + datetime.timedelta(days=i+1))
-                    self.year, self.month, self.day = final_date.year, final_date.month, final_date.day
-                    print(f"Game ended during year skip (event) on {self.day}/{self.month}/{self.year}")
-                    self.approval_history.append(self.pm.global_approval); self.approval_dates.append(final_date)
-                    return False # Stop skipping
-
-            # Record approval periodically during skip for graph
-            if (i + 1) % 30 == 0: # Record roughly monthly
-                interim_date = (datetime.date(self.year, self.month, self.day) + datetime.timedelta(days=i+1))
-                self.approval_history.append(self.pm.global_approval)
-                # Ensure date is valid before appending
-                try: valid_date = datetime.date(interim_date.year, interim_date.month, interim_date.day)
-                except ValueError: continue # Skip if date becomes invalid during skip
-                self.approval_dates.append(valid_date)
-
-        # Update final date after skip completes successfully
-        final_date = (datetime.date(self.year, self.month, self.day) + datetime.timedelta(days=num_days_to_skip))
-        self.year, self.month, self.day = final_date.year, final_date.month, final_date.day
-
-        # Add final data point
-        self.approval_history.append(self.pm.global_approval)
-        self.approval_dates.append(final_date)
-
-        # Final check for election trigger after skip (if still running)
-        if self.running: self.check_for_election()
-
-        print(f"Skipped from {original_date_str} to {self.day}/{self.month}/{self.year}")
+        self.events.append(
+            f"Skipped ahead from {start_date.isoformat()} to {self.current_date.isoformat()}."
+        )
+        if len(self.events) > 10:
+            self.events.pop(0)
         return self.running
 
     # ** MODIFIED: Return prefecture data including growth rate **
@@ -1353,9 +1298,10 @@ class JapanPMSimulatorApp:
         self.title_label = tk.Label(self.info_frame, text=f"Prime Minister {self.simulation.pm.name} ({self.simulation.pm.party_name})", font=("Arial", 16, "bold"), bg="#e1e1f0"); self.title_label.grid(row=0, column=0, columnspan=2, sticky="w")
         self.date_label = tk.Label(self.info_frame, text=f"Date: {self.simulation.day}/{self.simulation.month}/{self.simulation.year}", font=("Arial", 12), bg="#e1e1f0"); self.date_label.grid(row=1, column=0, sticky="w")
         self.approval_label = tk.Label(self.info_frame, text=f"Approval: {self.simulation.pm.global_approval:.2f}%", font=("Arial", 12), bg="#e1e1f0"); self.approval_label.grid(row=1, column=1, sticky="e")
+        self.term_label = tk.Label(self.info_frame, text="", font=("Arial", 11), bg="#e1e1f0"); self.term_label.grid(row=2, column=0, sticky="w")
         # ** NEW: Election Status Label **
         self.election_status_label = tk.Label(self.info_frame, text="", font=("Arial", 12, "bold"), fg="red", bg="#e1e1f0");
-        self.election_status_label.grid(row=2, column=0, columnspan=2, sticky="w")
+        self.election_status_label.grid(row=3, column=0, columnspan=2, sticky="w")
 
 
         # Middle section (graph/events - remains same structure)
@@ -1388,6 +1334,7 @@ class JapanPMSimulatorApp:
         control_frame = tk.Frame(policy_frame, bg="#f0f0f8"); control_frame.pack(pady=5)
         self.next_day_btn = tk.Button(control_frame, text="Next Day ➡️", command=self.next_day, width=btn_width*2, height=btn_height, bg="#9C27B0", fg="white", font=btn_font); self.next_day_btn.grid(row=0, column=0, padx=3, pady=3)
         self.skip_year_btn = tk.Button(control_frame, text="Skip Year ⏩", command=self.skip_year, width=btn_width*2, height=btn_height, bg="#673AB7", fg="white", font=btn_font); self.skip_year_btn.grid(row=0, column=1, padx=3, pady=3)
+        self.dissolve_btn = tk.Button(control_frame, text="Dissolve House of Representatives 🏛️", command=self.manual_dissolution, width=btn_width*2, height=btn_height, bg="#f44336", fg="white", font=btn_font); self.dissolve_btn.grid(row=0, column=2, padx=3, pady=3)
 
         # Bottom Menu (Save, Stats, End Game)
         self.menu_frame = tk.Frame(main_frame, bg="#f0f0f8"); self.menu_frame.pack(fill=tk.X, padx=10, pady=5)
@@ -1455,8 +1402,11 @@ class JapanPMSimulatorApp:
             return
 
         # Update standard labels
-        self.date_label.config(text=f"Date: {self.simulation.day}/{self.simulation.month}/{self.simulation.year}")
-        self.approval_label.config(text=f"Approval: {self.simulation.pm.global_approval:.2f}%")
+        self.date_label.config(text=f"Date: {self.simulation.current_date.isoformat()}")
+        self.approval_label.config(
+            text=f"Approval: {self.simulation.pm.global_approval:.2f}% | Seats: {self.simulation.seats}/{DIET_TOTAL_SEATS} ({self.simulation.coalition_name})"
+        )
+        self.term_label.config(text=f"Days Remaining in Term: {self.simulation.days_to_term_end}")
 
         # Update election status label and button states
         election_status_text = ""
@@ -1471,6 +1421,8 @@ class JapanPMSimulatorApp:
             election_status_text = "ELECTION: Voting Day! Results soon..."
             action_button_state = tk.DISABLED
 
+        if not election_status_text:
+            election_status_text = "Override Power: Yes" if self.simulation.override_power else "Override Power: No"
         self.election_status_label.config(text=election_status_text)
 
         # Enable/disable buttons based on election state
@@ -1478,6 +1430,8 @@ class JapanPMSimulatorApp:
             if btn: btn.config(state=action_button_state)
         if hasattr(self, 'next_day_btn'): self.next_day_btn.config(state=tk.NORMAL) # Next day always active to advance election
         if hasattr(self, 'skip_year_btn'): self.skip_year_btn.config(state=action_button_state)
+        if hasattr(self, 'dissolve_btn'):
+            self.dissolve_btn.config(state=tk.DISABLED if self.simulation.election_in_progress else tk.NORMAL)
         if hasattr(self, 'save_btn'): self.save_btn.config(state=action_button_state) # Prevent saving during election?
 
 
@@ -1504,6 +1458,16 @@ class JapanPMSimulatorApp:
         if hasattr(self.simulation, 'election_survival_message') and self.simulation.election_survival_message:
             messagebox.showinfo("Election Result", self.simulation.election_survival_message)
             self.simulation.election_survival_message = None # Clear message
+
+    def manual_dissolution(self):
+        if not self.simulation or not self.simulation.running:
+            return
+        if self.simulation.election_in_progress:
+            messagebox.showwarning("Action Blocked", "An election is already in progress.")
+            return
+        if messagebox.askyesno("Dissolve Diet", "Dissolve the House and call a snap election?"):
+            self.simulation.dissolve_diet()
+            self.update_display()
 
 
     def policy_action(self, policy_type):
